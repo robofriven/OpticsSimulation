@@ -1,0 +1,134 @@
+#pragma kernel InitRays
+#pragma kernel StepRays
+#pragma kernel ClearDetector
+
+struct Ray {
+    float3 pos;
+    float3 dir;
+    float  weight;
+    uint   alive;
+    uint   bounces;
+};
+
+RWStructuredBuffer<Ray> Rays;
+RWTexture2D<uint>       Detector;   // R32_UINT
+
+cbuffer Params {
+    uint  RayCount;
+    float StepSize;
+
+    float3 EmitterPos;
+    float3 Axis;
+    float  SigmaRad;
+
+    float2 DetSize;       // pixels (w,h)
+    float4 DetPlane;      // n.xyz, d  with n·x + d = 0
+    float3 DetU;          // detector basis U vector (world)
+    float3 DetV;          // detector basis V vector (world)
+    float2 DetPixScale;   // world→pixels scale along U,V
+
+    uint  MaxBounces;
+}
+
+uint wang_hash(uint s){ s=(s^61u)^(s>>16); s*=9u; s^=(s>>4); s*=0x27d4eb2du; s^=(s>>15); return s; }
+float2 rng2(uint i, uint frame){
+    uint a=wang_hash(i*747796405u+frame*2891336453u);
+    uint b=wang_hash(a+0x9E3779B9u);
+    return float2((a&0x00FFFFFFu)/16777216.0, (b&0x00FFFFFFu)/16777216.0);
+}
+
+// Gaussian cone around Axis (small-angle)
+float3 gaussianConeDir(float3 axis, float sigma, float2 u)
+{
+    float r = sqrt(max(-2.0*log(max(u.x,1e-7)), 0.0));
+    float theta = 6.2831853*u.y;
+    float2 n2 = r*float2(cos(theta), sin(theta));
+    float dx = sigma * n2.x;
+    float dy = sigma * n2.y;
+
+    float3 w = normalize(axis);
+    float3 a = (abs(w.z) < 0.999) ? float3(0,0,1) : float3(0,1,0);
+    float3 uu = normalize(cross(a,w));
+    float3 vv = cross(w,uu);
+    return normalize(w + dx*uu + dy*vv);
+}
+
+[numthreads(256,1,1)]
+void InitRays(uint3 tid: SV_DispatchThreadID)
+{
+    uint i = tid.x;
+    if (i >= RayCount) return;
+
+    float2 u = rng2(i, 0);
+    Ray r;
+    r.pos     = EmitterPos;
+    r.dir     = gaussianConeDir(Axis, SigmaRad, u);
+    r.weight  = 1.0;
+    r.alive   = 1u;
+    r.bounces = 0u;
+    Rays[i]   = r;
+}
+
+bool intersectPlane(float3 ro, float3 rd, float4 plane, out float t)
+{
+    float denom = dot(rd, plane.xyz);
+    if (abs(denom) < 1e-6) { t = 0; return false; }
+    t = -(dot(ro, plane.xyz) + plane.w) / denom;
+    return t > 0;
+}
+
+int2 projectToDetector(float3 p, float3 originOnPlane, float3 U, float3 V, float2 scale)
+{
+    float3 rel = p - originOnPlane;
+    float u = dot(rel, normalize(U)) * scale.x;
+    float v = dot(rel, normalize(V)) * scale.y;
+    return int2(u, v);
+}
+
+[numthreads(256,1,1)]
+void StepRays(uint3 tid: SV_DispatchThreadID)
+{
+    uint i = tid.x;
+    if (i >= RayCount) return;
+    Ray r = Rays[i];
+    if (r.alive == 0u) return;
+
+    float tHit;
+    if (intersectPlane(r.pos, r.dir, DetPlane, tHit))
+    {
+        float3 hit = r.pos + r.dir * tHit;
+
+        // pick any point on plane: origin = -d * n
+        float3 planeOrigin = -DetPlane.w * DetPlane.xyz;
+
+        int2 pix = projectToDetector(hit, planeOrigin, DetU, DetV, DetPixScale);
+        if (pix.x >= 0 && pix.y >= 0 && pix.x < DetSize.x && pix.y < DetSize.y)
+        {
+            InterlockedAdd(Detector[pix], (uint)1);
+        }
+
+        // stop or reflect once
+        if (r.bounces >= MaxBounces) {
+            r.alive = 0u;
+        } else {
+            float3 n = normalize(DetPlane.xyz);
+            r.pos = hit + 1e-4*n;
+            r.dir = normalize(reflect(r.dir, n));
+            r.bounces++;
+        }
+        Rays[i] = r;
+        return;
+    }
+
+    // no plane this step: march a bit
+    r.pos += r.dir * StepSize;
+    if (any(r.pos != r.pos) || any(abs(r.pos) > 1e6)) r.alive = 0u;
+    Rays[i] = r;
+}
+
+[numthreads(16,16,1)]
+void ClearDetector(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= (uint)DetSize.x || tid.y >= (uint)DetSize.y) return;
+    Detector[int2(tid.xy)] = 0u;
+}

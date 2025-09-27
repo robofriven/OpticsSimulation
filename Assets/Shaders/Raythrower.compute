@@ -1,0 +1,88 @@
+#pragma kernel InitRays
+#pragma kernel StepRays
+#pragma kernel ClearTarget
+
+#define THREADS 256
+
+struct Ray {
+    float2 pos;
+    float2 dir;
+    float  alive; // 1 = alive, 0 = dead
+};
+
+RWStructuredBuffer<Ray> Rays;           // match name exactly everywhere
+RWTexture2D<float4>     Target;         // UAV render target (RandomWrite enabled)
+
+cbuffer Params {
+    uint  RayCount;
+    float StepSize;        // pixels per step
+    float2 EmitterPos;     // in pixels
+    float AngleSpan;       // radians
+    float2 TargetSize;     // width, height in pixels
+    uint  Frame;           // frame counter for simple time-based jitter (unused for now)
+}
+
+uint wang_hash(uint s) {
+    s = (s ^ 61u) ^ (s >> 16);
+    s *= 9u;
+    s = s ^ (s >> 4);
+    s *= 0x27d4eb2du;
+    s = s ^ (s >> 15);
+    return s;
+}
+float rand01(uint s) {
+    return (float)(wang_hash(s) & 0x00FFFFFFu) / 16777216.0; // 24-bit mask
+}
+
+[numthreads(THREADS, 1, 1)]
+void InitRays(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= RayCount) return;
+
+    // fan a batch of rays across AngleSpan centered on +X
+    float t = (RayCount == 1) ? 0.5 : ( (float)i + 0.5 ) / max(1.0, (float)RayCount);
+    float angle = (t - 0.5) * AngleSpan;
+    float2 dir = float2(cos(angle), sin(angle));
+
+    Ray r;
+    r.pos   = EmitterPos;
+    r.dir   = dir;
+    r.alive = 1.0;
+    Rays[i] = r;
+}
+
+[numthreads(THREADS, 1, 1)]
+void StepRays(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= RayCount) return;
+
+    Ray r = Rays[i];
+    if (r.alive < 0.5) return; // dead ray
+
+    // advance one step
+    r.pos += r.dir * StepSize;
+
+    // kill if out of bounds
+    if (r.pos.x < 0.0 || r.pos.y < 0.0 || r.pos.x >= TargetSize.x || r.pos.y >= TargetSize.y) {
+        r.alive = 0.0;
+        Rays[i] = r;
+        return;
+    }
+
+    // write a little energy to the target
+    int2 p = (int2)r.pos;
+    float brightness = 0.02; // tiny so repeated steps leave a trail
+    float4 current = Target[p];
+    Target[p] = current + float4(brightness, brightness, brightness, 1.0);
+
+    Rays[i] = r;
+}
+
+[numthreads(8, 8, 1)]
+void ClearTarget(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= (uint)TargetSize.x || tid.y >= (uint)TargetSize.y) return;
+    Target[int2(tid.xy)] = float4(0, 0, 0, 1);
+}
